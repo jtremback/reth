@@ -1,0 +1,19 @@
+[package]
+name = "payload-parsing"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Reth dependencies
+reth-primitives = { path = "../../crates/primitives" }
+reth-ethereum-primitives = { path = "../../crates/ethereum/primitives" }
+reth-ethereum-engine-primitives = { path = "../../crates/ethereum/engine-primitives" }
+alloy-rpc-types-engine = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+
+# Other dependencies
+hex = "0.4"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+anyhow = "1.0" 

@@ -1,0 +1,31 @@
+[package]
+name = "block-execution"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# reth dependencies
+reth-primitives = { path = "../../crates/primitives" }
+reth-primitives-traits = { path = "../../crates/primitives-traits" }
+reth-ethereum-primitives = { path = "../../crates/ethereum/primitives" }
+reth-ethereum-engine-primitives = { path = "../../crates/ethereum/engine-primitives" }
+reth-evm = { path = "../../crates/evm" }
+reth-revm = { path = "../../crates/revm" }
+reth-db = { path = "../../crates/storage/db", features = ["test-utils"] }
+reth-db-common = { path = "../../crates/storage/db-common" }
+reth-provider = { path = "../../crates/storage/provider" }
+reth-chainspec = { path = "../../crates/chainspec" }
+reth-node-ethereum = { path = "../../crates/ethereum/node" }
+reth-trie = { path = "../../crates/trie/trie" }
+reth-e2e-test-utils = { path = "../../crates/e2e-test-utils" }
+
+# external dependencies
+alloy-primitives = { workspace = true }
+alloy-rpc-types-engine = { workspace = true }
+alloy-consensus = { workspace = true }
+alloy-genesis = { workspace = true }
+alloy-chains = { workspace = true }
+revm = { workspace = true }
+eyre = { workspace = true }
+serde_json = { workspace = true } 
