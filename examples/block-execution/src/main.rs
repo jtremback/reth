@@ -151,26 +151,29 @@ fn main() -> Result<()> {
     // Initialize genesis state
     init_genesis(&factory)?;
     
-    // Create a serialized block with a transaction to transfer 1 ETH
-    let serialized_block = SerializedBlock::new(
+    // Generate both blocks ahead of time
+    println!("Generating blocks...");
+    let first_block = SerializedBlock::new(
         &signer,
         recipient,
         U256::from(1_000_000_000_000_000_000u64), // 1 ETH
         0, // nonce
-    )?;
+    )?.into_block()?;
     
-    // Convert serialized block back to Block type
-    let block = serialized_block.into_block()?;
+    let second_block = SerializedBlock::new(
+        &signer,
+        recipient,
+        U256::from(500_000_000_000_000_000u64), // 0.5 ETH
+        1, // nonce
+    )?.into_block()?;
     
-    // Debug: Print recovered signer from the first transaction
-    if let Some(tx) = block.body.transactions.first() {
+    // Execute first block
+    println!("\nExecuting first block...");
+    if let Some(tx) = first_block.body.transactions.first() {
         println!("Transaction signer: {}", tx.recover_signer().unwrap());
     }
     
-    // Create block executor
     let executor_provider = EthExecutorProvider::ethereum(spec.clone());
-    
-    // Debug: Check if account state was properly set up
     let state_provider = factory.latest()?;
     if let Some(account) = state_provider.basic_account(&sender)? {
         println!("Sender account found with balance: {}", account.balance);
@@ -178,17 +181,13 @@ fn main() -> Result<()> {
         println!("Warning: Sender account not found in state!");
     }
     
-    // Use the state provider for execution
     let executor = executor_provider.executor(StateProviderDatabase::new(&state_provider));
-
-    // Execute the entire block
-    let recovered_block = RecoveredBlock::try_recover(block)?;
+    let recovered_block = RecoveredBlock::try_recover(first_block)?;
     let result = executor.execute(&recovered_block)?;
     println!("Block execution completed:");
     println!("  Gas used: {}", result.gas_used);
     println!("  Number of receipts: {}", result.receipts.len());
     
-    // Store results in a new transaction
     let provider_rw = factory.provider_rw()?;
     let execution_outcome = ExecutionOutcome::from((result, recovered_block.number()));
     provider_rw.append_blocks_with_state(
@@ -198,26 +197,14 @@ fn main() -> Result<()> {
         TrieUpdates::default(),
     )?;
     provider_rw.commit()?;
-
     println!("First block executed and stored successfully!");
     
-    // Create a second block where recipient sends 0.5 ETH back to sender
-    let second_block = SerializedBlock::new(
-        &signer,
-        recipient,
-        U256::from(500_000_000_000_000_000u64), // 0.5 ETH
-        1, // nonce
-    )?;
-    
-    // Convert second block back to Block type
-    let block = second_block.into_block()?;
-    
-    // Debug: Print recovered signer from the second transaction
-    if let Some(tx) = block.body.transactions.first() {
-        println!("\nSecond block transaction signer: {}", tx.recover_signer().unwrap());
+    // Execute second block
+    println!("\nExecuting second block...");
+    if let Some(tx) = second_block.body.transactions.first() {
+        println!("Transaction signer: {}", tx.recover_signer().unwrap());
     }
     
-    // Debug: Check account states before second block execution
     let state_provider = factory.latest()?;
     if let Some(account) = state_provider.basic_account(&sender)? {
         println!("Sender balance before second block: {}", account.balance);
@@ -226,17 +213,13 @@ fn main() -> Result<()> {
         println!("Recipient balance before second block: {}", account.balance);
     }
     
-    // Use the state provider for execution
     let executor = executor_provider.executor(StateProviderDatabase::new(&state_provider));
-
-    // Execute the second block
-    let recovered_block = RecoveredBlock::try_recover(block)?;
+    let recovered_block = RecoveredBlock::try_recover(second_block)?;
     let result = executor.execute(&recovered_block)?;
-    println!("\nSecond block execution completed:");
+    println!("Block execution completed:");
     println!("  Gas used: {}", result.gas_used);
     println!("  Number of receipts: {}", result.receipts.len());
     
-    // Store results of second block
     let provider_rw = factory.provider_rw()?;
     let execution_outcome = ExecutionOutcome::from((result, recovered_block.number()));
     provider_rw.append_blocks_with_state(
@@ -247,7 +230,7 @@ fn main() -> Result<()> {
     )?;
     provider_rw.commit()?;
 
-    // Debug: Check final account states
+    // Print final state
     let state_provider = factory.latest()?;
     if let Some(account) = state_provider.basic_account(&sender)? {
         println!("\nFinal sender balance: {}", account.balance);
@@ -255,7 +238,6 @@ fn main() -> Result<()> {
     if let Some(account) = state_provider.basic_account(&recipient)? {
         println!("Final recipient balance: {}", account.balance);
     }
-
     println!("\nSecond block executed and stored successfully!");
     Ok(())
 }
