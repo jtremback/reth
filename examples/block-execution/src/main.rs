@@ -2,7 +2,7 @@ use alloy_primitives::{Address, B256, Bloom, Bytes, FixedBytes, U256, TxKind};
 use alloy_rpc_types_engine::ExecutionPayloadV1;
 use eyre::Result;
 use reth_primitives::{Block, BlockBody, Header, RecoveredBlock, Transaction, TransactionSigned};
-use alloy_consensus::{TxEip1559, BlockHeader};
+use alloy_consensus::{TxEip1559, BlockHeader, SignableTransaction};
 use reth_provider::{
     providers::StaticFileProvider,
     BlockWriter, AccountReader,
@@ -14,11 +14,17 @@ use reth_evm::execute::{BlockExecutorProvider, Executor, ExecutionOutcome};
 use reth_db::test_utils::{create_test_rw_db, create_test_static_files_dir};
 use reth_trie::{HashedPostStateSorted, updates::TrieUpdates};
 use std::{sync::Arc, str::FromStr, collections::BTreeMap};
-use reth_primitives_traits::transaction::signature::Signature;
 use reth_primitives_traits::SignedTransaction;
 use serde_json;
 use alloy_genesis::{Genesis, ChainConfig, GenesisAccount};
 use reth_db_common::init::init_genesis;
+use alloy_signer_local::{coins_bip39::English, MnemonicBuilder, LocalSigner};
+use alloy_signer::Signer;
+use k256::ecdsa::SigningKey;
+use tokio::runtime::Runtime;
+
+/// Test mnemonic for wallet generation
+const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
 
 /// A custom struct to handle raw block bytes
 pub struct SerializedBlock {
@@ -27,8 +33,9 @@ pub struct SerializedBlock {
 
 impl SerializedBlock {
     /// Create a new serialized block with a test transaction
-    pub fn new(sender: Address, recipient: Address, value: U256, nonce: u64) -> Self {
-        let transaction = create_test_transaction(sender, recipient, value, nonce);
+    pub fn new(signer: &LocalSigner<SigningKey>, recipient: Address, value: U256, nonce: u64) -> Result<Self> {
+        let rt = Runtime::new()?;
+        let transaction = rt.block_on(create_test_transaction(signer, recipient, value, nonce))?;
         let block = create_test_block(vec![transaction]);
         
         // Convert block to payload
@@ -36,7 +43,7 @@ impl SerializedBlock {
         
         // Convert payload to JSON bytes
         let bytes = serde_json::to_vec(&payload).unwrap_or_default();
-        Self { bytes }
+        Ok(Self { bytes })
     }
 
     /// Parse the bytes into an ExecutionPayloadV1
@@ -52,7 +59,7 @@ impl SerializedBlock {
 }
 
 /// Helper function to create a signed transaction (ETH transfer)
-fn create_test_transaction(_from: Address, to: Address, value: U256, nonce: u64) -> TransactionSigned {
+async fn create_test_transaction(signer: &LocalSigner<SigningKey>, to: Address, value: U256, nonce: u64) -> Result<TransactionSigned> {
     let tx = Transaction::Eip1559(TxEip1559 {
         chain_id: 1, // mainnet
         nonce,
@@ -65,9 +72,10 @@ fn create_test_transaction(_from: Address, to: Address, value: U256, nonce: u64)
         access_list: Default::default(),
     });
     
-    // Note: In a real scenario, you would sign this with a private key
-    // For this example, we use a test signature
-    TransactionSigned::new_unhashed(tx, Signature::test_signature())
+    // Sign the transaction with our private key
+    let signature_hash = tx.signature_hash();
+    let signature = signer.sign_hash(&signature_hash).await?;
+    Ok(TransactionSigned::new_unhashed(tx, signature))
 }
 
 /// A simple example showing how to:
@@ -76,9 +84,17 @@ fn create_test_transaction(_from: Address, to: Address, value: U256, nonce: u64)
 /// 3. Execute it using Reth's EVM
 /// 4. Store the results in the database
 fn main() -> Result<()> {
-    // Set up sender and recipient addresses
-    let sender = Address::from_str("0x2ec9c1f8249343B2B6D01775CC13d990fCD9c7d8")?;
+    // Create a wallet from mnemonic
+    let signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()
+        .expect("Failed to create wallet");
+    
+    // Get the sender address from the wallet
+    let sender = signer.address();
     let recipient = Address::from_str("0x1000000000000000000000000000000000000000")?;
+    
+    println!("Using sender address: {}", sender);
     
     // Create genesis configuration with pre-funded accounts
     let mut alloc = BTreeMap::new();
@@ -137,11 +153,11 @@ fn main() -> Result<()> {
     
     // Create a serialized block with a transaction to transfer 1 ETH
     let serialized_block = SerializedBlock::new(
-        sender,
+        &signer,
         recipient,
         U256::from(1_000_000_000_000_000_000u64), // 1 ETH
         0, // nonce
-    );
+    )?;
     
     // Convert serialized block back to Block type
     let block = serialized_block.into_block()?;
@@ -152,7 +168,7 @@ fn main() -> Result<()> {
     }
     
     // Create block executor
-    let executor = EthExecutorProvider::ethereum(spec.clone());
+    let executor_provider = EthExecutorProvider::ethereum(spec.clone());
     
     // Debug: Check if account state was properly set up
     let state_provider = factory.latest()?;
@@ -163,7 +179,7 @@ fn main() -> Result<()> {
     }
     
     // Use the state provider for execution
-    let executor = executor.executor(StateProviderDatabase::new(&state_provider));
+    let executor = executor_provider.executor(StateProviderDatabase::new(&state_provider));
 
     // Execute the entire block
     let recovered_block = RecoveredBlock::try_recover(block)?;
@@ -183,13 +199,73 @@ fn main() -> Result<()> {
     )?;
     provider_rw.commit()?;
 
-    println!("Block executed and stored successfully!");
+    println!("First block executed and stored successfully!");
+    
+    // Create a second block where recipient sends 0.5 ETH back to sender
+    let second_block = SerializedBlock::new(
+        &signer,
+        recipient,
+        U256::from(500_000_000_000_000_000u64), // 0.5 ETH
+        1, // nonce
+    )?;
+    
+    // Convert second block back to Block type
+    let block = second_block.into_block()?;
+    
+    // Debug: Print recovered signer from the second transaction
+    if let Some(tx) = block.body.transactions.first() {
+        println!("\nSecond block transaction signer: {}", tx.recover_signer().unwrap());
+    }
+    
+    // Debug: Check account states before second block execution
+    let state_provider = factory.latest()?;
+    if let Some(account) = state_provider.basic_account(&sender)? {
+        println!("Sender balance before second block: {}", account.balance);
+    }
+    if let Some(account) = state_provider.basic_account(&recipient)? {
+        println!("Recipient balance before second block: {}", account.balance);
+    }
+    
+    // Use the state provider for execution
+    let executor = executor_provider.executor(StateProviderDatabase::new(&state_provider));
+
+    // Execute the second block
+    let recovered_block = RecoveredBlock::try_recover(block)?;
+    let result = executor.execute(&recovered_block)?;
+    println!("\nSecond block execution completed:");
+    println!("  Gas used: {}", result.gas_used);
+    println!("  Number of receipts: {}", result.receipts.len());
+    
+    // Store results of second block
+    let provider_rw = factory.provider_rw()?;
+    let execution_outcome = ExecutionOutcome::from((result, recovered_block.number()));
+    provider_rw.append_blocks_with_state(
+        vec![recovered_block],
+        &execution_outcome,
+        HashedPostStateSorted::default(),
+        TrieUpdates::default(),
+    )?;
+    provider_rw.commit()?;
+
+    // Debug: Check final account states
+    let state_provider = factory.latest()?;
+    if let Some(account) = state_provider.basic_account(&sender)? {
+        println!("\nFinal sender balance: {}", account.balance);
+    }
+    if let Some(account) = state_provider.basic_account(&recipient)? {
+        println!("Final recipient balance: {}", account.balance);
+    }
+
+    println!("\nSecond block executed and stored successfully!");
     Ok(())
 }
 
 /// Creates a test block with the given transactions
 fn create_test_block(transactions: Vec<TransactionSigned>) -> Block {
     // Create a header with minimal data
+    static NEXT_BLOCK_NUMBER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let block_number = NEXT_BLOCK_NUMBER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    
     let header = Header {
         parent_hash: B256::default(),
         ommers_hash: B256::default(),
@@ -199,7 +275,7 @@ fn create_test_block(transactions: Vec<TransactionSigned>) -> Block {
         receipts_root: B256::default(),
         logs_bloom: Bloom::default(),
         difficulty: U256::ZERO,
-        number: 1,
+        number: block_number,
         gas_limit: 30_000_000,
         gas_used: 0,
         timestamp: 1234567890u64,
@@ -231,15 +307,20 @@ mod tests {
 
     #[test]
     fn test_block_serialization() -> Result<()> {
-        let sender = Address::from_str("0x2ec9c1f8249343B2B6D01775CC13d990fCD9c7d8")?;
+        // Create a wallet from mnemonic
+        let signer = MnemonicBuilder::<English>::default()
+            .phrase(TEST_MNEMONIC)
+            .build()
+            .expect("Failed to create wallet");
+        
         let recipient = Address::from_str("0x1000000000000000000000000000000000000000")?;
         
         let serialized_block = SerializedBlock::new(
-            sender,
+            &signer,
             recipient,
             U256::from(1_000_000_000_000_000_000u64),
             0,
-        );
+        )?;
         
         let block = serialized_block.into_block()?;
         assert_eq!(block.number, 1);
@@ -247,4 +328,4 @@ mod tests {
         
         Ok(())
     }
-} 
+}
