@@ -102,41 +102,6 @@ fn generate_test_blocks(signer: &LocalSigner<SigningKey>, recipient: Address) ->
     Ok(vec![first_block, second_block])
 }
 
-/// Create a genesis configuration with pre-funded accounts
-fn create_genesis(funded_address: Address) -> Genesis {
-    // Create genesis configuration with pre-funded accounts
-    let mut alloc = BTreeMap::new();
-    alloc.insert(
-        funded_address,
-        GenesisAccount {
-            balance: U256::from(10_000_000_000_000_000_000u64), // 10 ETH
-            ..Default::default()
-        },
-    );
-    
-    Genesis {
-        config: ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0),
-            eip150_block: Some(0),
-            eip155_block: Some(0),
-            eip158_block: Some(0),
-            byzantium_block: Some(0),
-            constantinople_block: Some(0),
-            petersburg_block: Some(0),
-            istanbul_block: Some(0),
-            berlin_block: Some(0),
-            london_block: Some(0),
-            shanghai_time: Some(0),
-            terminal_total_difficulty: Some(U256::ZERO),
-            terminal_total_difficulty_passed: true,
-            ..Default::default()
-        },
-        alloc,
-        ..Default::default()
-    }
-}
-
 /// Handles block execution and database interactions
 struct BlockExecutor {
     factory: ProviderFactory<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
@@ -235,8 +200,40 @@ fn main() -> Result<()> {
     
     println!("Using sender address: {}", sender);
     
-    // Create genesis configuration and block executor
-    let genesis = create_genesis(sender);
+    // Create genesis configuration with pre-funded accounts
+    let mut alloc = BTreeMap::new();
+    alloc.insert(
+        sender,
+        GenesisAccount {
+            balance: U256::from(10_000_000_000_000_000_000u64), // 10 ETH
+            ..Default::default()
+        },
+    );
+    
+    // Create genesis configuration
+    let genesis = Genesis {
+        config: ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0),
+            eip150_block: Some(0),
+            eip155_block: Some(0),
+            eip158_block: Some(0),
+            byzantium_block: Some(0),
+            constantinople_block: Some(0),
+            petersburg_block: Some(0),
+            istanbul_block: Some(0),
+            berlin_block: Some(0),
+            london_block: Some(0),
+            shanghai_time: Some(0),
+            terminal_total_difficulty: Some(U256::ZERO),
+            terminal_total_difficulty_passed: true,
+            ..Default::default()
+        },
+        alloc,
+        ..Default::default()
+    };
+
+    // Create block executor
     let executor = BlockExecutor::new(db_path, genesis)?;
     
     // Generate blocks
