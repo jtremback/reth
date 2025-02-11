@@ -22,6 +22,10 @@ use alloy_signer_local::{coins_bip39::English, MnemonicBuilder, LocalSigner};
 use alloy_signer::Signer;
 use k256::ecdsa::SigningKey;
 use tokio::runtime::Runtime;
+use reth_db::{mdbx::DatabaseArguments, DatabaseEnv};
+use std::path::PathBuf;
+use reth_provider::ProviderFactory;
+use reth_node_api::NodeTypesWithDBAdapter;
 
 /// Test mnemonic for wallet generation
 const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -84,6 +88,17 @@ async fn create_test_transaction(signer: &LocalSigner<SigningKey>, to: Address, 
 /// 3. Execute it using Reth's EVM
 /// 4. Store the results in the database
 fn main() -> Result<()> {
+    // Delete existing database folder if it exists
+    let _ = std::fs::remove_dir_all("./data");
+    
+    // Create paths for database and static files
+    let db_path = PathBuf::from("./data/db");
+    let static_files_path = db_path.join("static_files");
+
+    // Create directories if they don't exist
+    std::fs::create_dir_all(&db_path)?;
+    std::fs::create_dir_all(&static_files_path)?;
+
     // Create a wallet from mnemonic
     let signer = MnemonicBuilder::<English>::default()
         .phrase(TEST_MNEMONIC)
@@ -137,16 +152,14 @@ fn main() -> Result<()> {
             .genesis(genesis)         // Override with our custom genesis
             .build()
     );
-    
-    // Create a temporary database and static files directory
-    let (_static_dir, static_dir_path) = create_test_static_files_dir();
 
-    // Create the provider factory using the builder pattern
-    let factory = EthereumNode::provider_factory_builder()
-        .db(create_test_rw_db())
-        .chainspec(spec.clone())
-        .static_file(StaticFileProvider::read_write(static_dir_path)?)
-        .build_provider_factory();
+    // Create the provider factory using persistent storage
+    let factory = ProviderFactory::<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>::new_with_database_path(
+        &db_path,
+        spec.clone(),
+        DatabaseArguments::default(),
+        StaticFileProvider::read_write(static_files_path)?,
+    )?;
     
     // Initialize genesis state
     init_genesis(&factory)?;

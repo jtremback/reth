@@ -19,6 +19,7 @@ reth-chainspec = { path = "../../crates/chainspec" }
 reth-node-ethereum = { path = "../../crates/ethereum/node" }
 reth-trie = { path = "../../crates/trie/trie" }
 reth-e2e-test-utils = { path = "../../crates/e2e-test-utils" }
+reth-node-api = { path = "../../crates/node/api" }
 
 # external dependencies
 alloy-primitives = { workspace = true }

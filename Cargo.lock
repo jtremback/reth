@@ -1431,6 +1431,7 @@ dependencies = [
  "reth-ethereum-engine-primitives",
  "reth-ethereum-primitives",
  "reth-evm",
+ "reth-node-api",
  "reth-node-ethereum",
  "reth-primitives",
  "reth-primitives-traits",
