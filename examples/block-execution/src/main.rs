@@ -8,7 +8,7 @@ use reth_provider::{
     BlockWriter, AccountReader,
 };
 use reth_revm::database::StateProviderDatabase;
-use reth_chainspec::ChainSpecBuilder;
+use reth_chainspec::{ChainSpecBuilder, ChainSpec};
 use reth_node_ethereum::{EthereumNode, EthExecutorProvider};
 use reth_evm::execute::{BlockExecutorProvider, Executor, ExecutionOutcome};
 use reth_db::test_utils::{create_test_rw_db, create_test_static_files_dir};
@@ -82,49 +82,39 @@ async fn create_test_transaction(signer: &LocalSigner<SigningKey>, to: Address, 
     Ok(TransactionSigned::new_unhashed(tx, signature))
 }
 
-/// A simple example showing how to:
-/// 1. Create a serialized block with a real transaction
-/// 2. Convert it to an execution payload
-/// 3. Execute it using Reth's EVM
-/// 4. Store the results in the database
-fn main() -> Result<()> {
-    // Delete existing database folder if it exists
-    let _ = std::fs::remove_dir_all("./data");
+/// Generate test blocks that transfer ETH from sender to recipient
+fn generate_test_blocks(signer: &LocalSigner<SigningKey>, recipient: Address) -> Result<Vec<Block>> {
+    println!("Generating blocks...");
+    let first_block = SerializedBlock::new(
+        signer,
+        recipient,
+        U256::from(1_000_000_000_000_000_000u64), // 1 ETH
+        0, // nonce
+    )?.into_block()?;
     
-    // Create paths for database and static files
-    let db_path = PathBuf::from("./data/db");
-    let static_files_path = db_path.join("static_files");
+    let second_block = SerializedBlock::new(
+        signer,
+        recipient,
+        U256::from(500_000_000_000_000_000u64), // 0.5 ETH
+        1, // nonce
+    )?.into_block()?;
 
-    // Create directories if they don't exist
-    std::fs::create_dir_all(&db_path)?;
-    std::fs::create_dir_all(&static_files_path)?;
+    Ok(vec![first_block, second_block])
+}
 
-    // Create a wallet from mnemonic
-    let signer = MnemonicBuilder::<English>::default()
-        .phrase(TEST_MNEMONIC)
-        .build()
-        .expect("Failed to create wallet");
-    
-    // Get the sender address from the wallet
-    let sender = signer.address();
-    let recipient = Address::from_str("0x1000000000000000000000000000000000000000")?;
-    
-    println!("Using sender address: {}", sender);
-    
+/// Create a genesis configuration with pre-funded accounts
+fn create_genesis(funded_address: Address) -> Genesis {
     // Create genesis configuration with pre-funded accounts
     let mut alloc = BTreeMap::new();
-    
-    // Add sender with initial balance of 10 ETH
     alloc.insert(
-        sender,
+        funded_address,
         GenesisAccount {
             balance: U256::from(10_000_000_000_000_000_000u64), // 10 ETH
             ..Default::default()
         },
     );
     
-    // Create genesis configuration
-    let genesis = Genesis {
+    Genesis {
         config: ChainConfig {
             chain_id: 1,
             homestead_block: Some(0),
@@ -144,114 +134,135 @@ fn main() -> Result<()> {
         },
         alloc,
         ..Default::default()
-    };
-    
-    // Create chain specification with our genesis config
-    let spec = Arc::new(
-        ChainSpecBuilder::mainnet()  // Use mainnet as base configuration
-            .genesis(genesis)         // Override with our custom genesis
-            .build()
-    );
+    }
+}
 
-    // Create the provider factory using persistent storage
-    let factory = ProviderFactory::<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>::new_with_database_path(
-        &db_path,
-        spec.clone(),
-        DatabaseArguments::default(),
-        StaticFileProvider::read_write(static_files_path)?,
-    )?;
-    
-    // Initialize genesis state
-    init_genesis(&factory)?;
-    
-    // Generate both blocks ahead of time
-    println!("Generating blocks...");
-    let first_block = SerializedBlock::new(
-        &signer,
-        recipient,
-        U256::from(1_000_000_000_000_000_000u64), // 1 ETH
-        0, // nonce
-    )?.into_block()?;
-    
-    let second_block = SerializedBlock::new(
-        &signer,
-        recipient,
-        U256::from(500_000_000_000_000_000u64), // 0.5 ETH
-        1, // nonce
-    )?.into_block()?;
-    
-    // Execute first block
-    println!("\nExecuting first block...");
-    if let Some(tx) = first_block.body.transactions.first() {
-        println!("Transaction signer: {}", tx.recover_signer().unwrap());
-    }
-    
-    let executor_provider = EthExecutorProvider::ethereum(spec.clone());
-    let state_provider = factory.latest()?;
-    if let Some(account) = state_provider.basic_account(&sender)? {
-        println!("Sender account found with balance: {}", account.balance);
-    } else {
-        println!("Warning: Sender account not found in state!");
-    }
-    
-    let executor = executor_provider.executor(StateProviderDatabase::new(&state_provider));
-    let recovered_block = RecoveredBlock::try_recover(first_block)?;
-    let result = executor.execute(&recovered_block)?;
-    println!("Block execution completed:");
-    println!("  Gas used: {}", result.gas_used);
-    println!("  Number of receipts: {}", result.receipts.len());
-    
-    let provider_rw = factory.provider_rw()?;
-    let execution_outcome = ExecutionOutcome::from((result, recovered_block.number()));
-    provider_rw.append_blocks_with_state(
-        vec![recovered_block],
-        &execution_outcome,
-        HashedPostStateSorted::default(),
-        TrieUpdates::default(),
-    )?;
-    provider_rw.commit()?;
-    println!("First block executed and stored successfully!");
-    
-    // Execute second block
-    println!("\nExecuting second block...");
-    if let Some(tx) = second_block.body.transactions.first() {
-        println!("Transaction signer: {}", tx.recover_signer().unwrap());
-    }
-    
-    let state_provider = factory.latest()?;
-    if let Some(account) = state_provider.basic_account(&sender)? {
-        println!("Sender balance before second block: {}", account.balance);
-    }
-    if let Some(account) = state_provider.basic_account(&recipient)? {
-        println!("Recipient balance before second block: {}", account.balance);
-    }
-    
-    let executor = executor_provider.executor(StateProviderDatabase::new(&state_provider));
-    let recovered_block = RecoveredBlock::try_recover(second_block)?;
-    let result = executor.execute(&recovered_block)?;
-    println!("Block execution completed:");
-    println!("  Gas used: {}", result.gas_used);
-    println!("  Number of receipts: {}", result.receipts.len());
-    
-    let provider_rw = factory.provider_rw()?;
-    let execution_outcome = ExecutionOutcome::from((result, recovered_block.number()));
-    provider_rw.append_blocks_with_state(
-        vec![recovered_block],
-        &execution_outcome,
-        HashedPostStateSorted::default(),
-        TrieUpdates::default(),
-    )?;
-    provider_rw.commit()?;
+/// Handles block execution and database interactions
+struct BlockExecutor {
+    factory: ProviderFactory<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
+    spec: Arc<ChainSpec>,
+}
 
-    // Print final state
-    let state_provider = factory.latest()?;
-    if let Some(account) = state_provider.basic_account(&sender)? {
-        println!("\nFinal sender balance: {}", account.balance);
+impl BlockExecutor {
+    /// Create a new BlockExecutor with the given database path and genesis configuration
+    fn new(db_path: PathBuf, genesis: Genesis) -> Result<Self> {
+        // Create static files path
+        let static_files_path = db_path.join("static_files");
+
+        // Create directories if they don't exist
+        std::fs::create_dir_all(&db_path)?;
+        std::fs::create_dir_all(&static_files_path)?;
+
+        // Create chain specification
+        let spec = Arc::new(
+            ChainSpecBuilder::mainnet()
+                .genesis(genesis)
+                .build()
+        );
+
+        // Create the provider factory
+        let factory = ProviderFactory::<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>::new_with_database_path(
+            &db_path,
+            spec.clone(),
+            DatabaseArguments::default(),
+            StaticFileProvider::read_write(static_files_path)?,
+        )?;
+
+        // Initialize genesis state
+        init_genesis(&factory)?;
+
+        Ok(Self { factory, spec })
     }
-    if let Some(account) = state_provider.basic_account(&recipient)? {
-        println!("Final recipient balance: {}", account.balance);
+
+    /// Execute and commit the next block
+    fn next_block(&self, block: &Block) -> Result<()> {
+        println!("\nExecuting block {}...", block.number);
+        if let Some(tx) = block.body.transactions.first() {
+            println!("Transaction signer: {}", tx.recover_signer().unwrap());
+        }
+
+        let executor_provider = EthExecutorProvider::ethereum(self.spec.clone());
+        let state_provider = self.factory.latest()?;
+        
+        let executor = executor_provider.executor(StateProviderDatabase::new(&state_provider));
+        let recovered_block = RecoveredBlock::try_recover(block.clone())?;
+        let result = executor.execute(&recovered_block)?;
+        println!("Block execution completed:");
+        println!("  Gas used: {}", result.gas_used);
+        println!("  Number of receipts: {}", result.receipts.len());
+
+        let provider_rw = self.factory.provider_rw()?;
+        let execution_outcome = ExecutionOutcome::from((result, recovered_block.number()));
+        provider_rw.append_blocks_with_state(
+            vec![recovered_block],
+            &execution_outcome,
+            HashedPostStateSorted::default(),
+            TrieUpdates::default(),
+        )?;
+        provider_rw.commit()?;
+        println!("Block {} executed and stored successfully!", block.number);
+        Ok(())
     }
-    println!("\nSecond block executed and stored successfully!");
+
+    /// Get account balance
+    fn get_balance(&self, address: &Address) -> Result<Option<U256>> {
+        let state_provider = self.factory.latest()?;
+        Ok(state_provider.basic_account(address)?.map(|account| account.balance))
+    }
+}
+
+/// A simple example showing how to:
+/// 1. Create a serialized block with a real transaction
+/// 2. Convert it to an execution payload
+/// 3. Execute it using Reth's EVM
+/// 4. Store the results in the database
+fn main() -> Result<()> {
+    // Delete existing database folder if it exists
+    let _ = std::fs::remove_dir_all("./data");
+    
+    // Create paths for database
+    let db_path = PathBuf::from("./data/db");
+
+    // Create a wallet from mnemonic
+    let signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()
+        .expect("Failed to create wallet");
+    
+    // Get the sender address from the wallet
+    let sender = signer.address();
+    let recipient = Address::from_str("0x1000000000000000000000000000000000000000")?;
+    
+    println!("Using sender address: {}", sender);
+    
+    // Create genesis configuration and block executor
+    let genesis = create_genesis(sender);
+    let executor = BlockExecutor::new(db_path, genesis)?;
+    
+    // Generate blocks
+    let blocks = generate_test_blocks(&signer, recipient)?;
+
+    // Print initial balances
+    if let Some(balance) = executor.get_balance(&sender)? {
+        println!("Initial sender balance: {}", balance);
+    }
+    if let Some(balance) = executor.get_balance(&recipient)? {
+        println!("Initial recipient balance: {}", balance);
+    }
+
+    // Execute all blocks
+    for block in blocks.iter() {
+        executor.next_block(block)?;
+
+        // Print balances after each block
+        if let Some(balance) = executor.get_balance(&sender)? {
+            println!("Sender balance: {}", balance);
+        }
+        if let Some(balance) = executor.get_balance(&recipient)? {
+            println!("Recipient balance: {}", balance);
+        }
+    }
+
     Ok(())
 }
 
