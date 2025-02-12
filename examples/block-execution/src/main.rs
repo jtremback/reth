@@ -28,7 +28,12 @@ use std::io::{BufWriter, BufReader, Write, Read};
 use std::fs::File;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
-use reth_primitives_traits::transaction::signed::SignedTransaction;
+use reth_primitives_traits::{
+    transaction::signed::SignedTransaction,
+    Block as BlockTrait,
+    BlockBody as BlockBodyTrait,
+};
+use std::time::Instant;
 
 /// Test mnemonic for wallet generation
 const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -191,18 +196,35 @@ impl BlockExecutor {
             println!("Transaction signer: {}", tx.recover_signer().unwrap());
         }
 
+        let start_time = Instant::now();
+        
+        // Measure provider setup time
+        let provider_setup_start = Instant::now();
         let executor_provider = EthExecutorProvider::ethereum(self.spec.clone());
         let state_provider = self.factory.latest()?;
-        
         let executor = executor_provider.executor(StateProviderDatabase::new(&state_provider));
+        let provider_setup_time = provider_setup_start.elapsed();
+        
+        // Measure block recovery time
+        let recovery_start = Instant::now();
         let recovered_block = RecoveredBlock::try_recover(block.clone())?;
+        let recovery_time = recovery_start.elapsed();
+        
+        let execution_start = Instant::now();
         let result = executor.execute(&recovered_block)?;
-        println!("Block execution completed:");
-        println!("  Gas used: {}", result.gas_used);
-        println!("  Number of receipts: {}", result.receipts.len());
-
+        let execution_time = execution_start.elapsed();
+        
+        // Store these before moving result
+        let gas_used = result.gas_used;
+        let num_receipts = result.receipts.len();
+        
+        // Measure provider write setup time
+        let write_setup_start = Instant::now();
         let provider_rw = self.factory.provider_rw()?;
         let execution_outcome = ExecutionOutcome::from((result, recovered_block.number()));
+        let write_setup_time = write_setup_start.elapsed();
+
+        let commit_start = Instant::now();
         provider_rw.append_blocks_with_state(
             vec![recovered_block],
             &execution_outcome,
@@ -210,7 +232,31 @@ impl BlockExecutor {
             TrieUpdates::default(),
         )?;
         provider_rw.commit()?;
-        println!("Block {} executed and stored successfully!", block.number);
+        let commit_time = commit_start.elapsed();
+        
+        let total_time = start_time.elapsed();
+        
+        println!("Block execution completed:");
+        println!("  Gas used: {}", gas_used);
+        println!("  Number of receipts: {}", num_receipts);
+        
+        println!("\nBlock {} timing breakdown:", block.number);
+        println!("  Provider setup time: {:.2}s", provider_setup_time.as_secs_f64());
+        println!("  Block recovery time: {:.2}s", recovery_time.as_secs_f64());
+        println!("  Execution time: {:.2}s", execution_time.as_secs_f64());
+        println!("  Write setup time: {:.2}s", write_setup_time.as_secs_f64());
+        println!("  State commit time: {:.2}s", commit_time.as_secs_f64());
+        println!("  Total time: {:.2}s", total_time.as_secs_f64());
+        println!("  Other overhead: {:.2}s", 
+            total_time.as_secs_f64() - 
+            (provider_setup_time.as_secs_f64() + 
+             recovery_time.as_secs_f64() + 
+             execution_time.as_secs_f64() + 
+             write_setup_time.as_secs_f64() + 
+             commit_time.as_secs_f64())
+        );
+        println!("  Transactions per second: {:.2}", block.body.transactions.len() as f64 / total_time.as_secs_f64());
+        
         Ok(())
     }
 
