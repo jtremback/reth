@@ -11,10 +11,8 @@ use reth_revm::database::StateProviderDatabase;
 use reth_chainspec::{ChainSpecBuilder, ChainSpec};
 use reth_node_ethereum::{EthereumNode, EthExecutorProvider};
 use reth_evm::execute::{BlockExecutorProvider, Executor, ExecutionOutcome};
-use reth_db::test_utils::{create_test_rw_db, create_test_static_files_dir};
 use reth_trie::{HashedPostStateSorted, updates::TrieUpdates};
 use std::{sync::Arc, str::FromStr, collections::BTreeMap};
-use reth_primitives_traits::SignedTransaction;
 use serde_json;
 use alloy_genesis::{Genesis, ChainConfig, GenesisAccount};
 use reth_db_common::init::init_genesis;
@@ -26,6 +24,11 @@ use reth_db::{mdbx::DatabaseArguments, DatabaseEnv};
 use std::path::PathBuf;
 use reth_provider::ProviderFactory;
 use reth_node_api::NodeTypesWithDBAdapter;
+use std::io::{BufWriter, BufReader, Write, Read};
+use std::fs::File;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use reth_primitives_traits::transaction::signed::SignedTransaction;
 
 /// Test mnemonic for wallet generation
 const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -82,24 +85,66 @@ async fn create_test_transaction(signer: &LocalSigner<SigningKey>, to: Address, 
     Ok(TransactionSigned::new_unhashed(tx, signature))
 }
 
-/// Generate test blocks that transfer ETH from sender to recipient
-fn generate_test_blocks(signer: &LocalSigner<SigningKey>, recipient: Address) -> Result<Vec<Block>> {
-    println!("Generating blocks...");
-    let first_block = SerializedBlock::new(
-        signer,
-        recipient,
-        U256::from(1_000_000_000_000_000_000u64), // 1 ETH
-        0, // nonce
-    )?.into_block()?;
+/// Generate test blocks that transfer ETH from sender to recipient and write them to a file
+fn generate_test_blocks(
+    signer: &LocalSigner<SigningKey>, 
+    recipient: Address, 
+    txs_per_block: usize, 
+    num_blocks: usize,
+    output_file: &str,
+) -> Result<()> {
+    println!("Generating {} blocks with {} transactions each...", num_blocks, txs_per_block);
     
-    let second_block = SerializedBlock::new(
-        signer,
-        recipient,
-        U256::from(500_000_000_000_000_000u64), // 0.5 ETH
-        1, // nonce
-    )?.into_block()?;
+    // Create runtime for async transaction creation
+    let rt = Runtime::new()?;
+    let nonce_counter = AtomicU64::new(0);
+    
+    // Open file for writing
+    let file = File::create(output_file)?;
+    let mut writer = BufWriter::new(file);
+    
+    for block_num in 0..num_blocks {
+        // Generate transactions in parallel
+        let mut block_txs: Vec<TransactionSigned> = (0..txs_per_block)
+            .into_par_iter()
+            .map(|_| {
+                let nonce = nonce_counter.fetch_add(1, Ordering::SeqCst);
+                rt.block_on(create_test_transaction(
+                    signer,
+                    recipient,
+                    U256::from(10_000_000_000_000_000u64), // 0.01 ETH
+                    nonce,
+                )).expect("Failed to create transaction")
+            })
+            .collect();
 
-    Ok(vec![first_block, second_block])
+        // Sort transactions by nonce
+        block_txs.sort_by_key(|tx| {
+            if let Transaction::Eip1559(ref t) = tx.transaction() {
+                t.nonce
+            } else {
+                unreachable!("We only create EIP1559 transactions")
+            }
+        });
+        
+        // Create block and convert to serialized form
+        let block = create_test_block(block_txs);
+        let payload = ExecutionPayloadV1::from_block_slow(&block);
+        let bytes = serde_json::to_vec(&payload)?;
+        
+        // Write length of serialized block followed by the block itself
+        writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+        
+        println!("Generated and wrote block {} with {} transactions (size: {:.2} MB)", 
+            block_num + 1, 
+            txs_per_block,
+            bytes.len() as f64 / 1_000_000.0
+        );
+    }
+
+    Ok(())
 }
 
 /// Handles block execution and database interactions
@@ -176,6 +221,36 @@ impl BlockExecutor {
     }
 }
 
+/// Read blocks from a file one at a time
+struct BlockReader {
+    reader: BufReader<File>,
+}
+
+impl BlockReader {
+    fn new(path: &str) -> Result<Self> {
+        let file = File::open(path)?;
+        Ok(Self {
+            reader: BufReader::new(file),
+        })
+    }
+
+    fn next_block(&mut self) -> Result<Option<Block>> {
+        let mut len_bytes = [0u8; 4];
+        match self.reader.read_exact(&mut len_bytes) {
+            Ok(_) => {
+                let len = u32::from_be_bytes(len_bytes) as usize;
+                let mut block_bytes = vec![0u8; len];
+                self.reader.read_exact(&mut block_bytes)?;
+                
+                let payload: ExecutionPayloadV1 = serde_json::from_slice(&block_bytes)?;
+                Ok(Some(payload.try_into_block()?))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
 /// A simple example showing how to:
 /// 1. Create a serialized block with a real transaction
 /// 2. Convert it to an execution payload
@@ -185,8 +260,9 @@ fn main() -> Result<()> {
     // Delete existing database folder if it exists
     let _ = std::fs::remove_dir_all("./data");
     
-    // Create paths for database
+    // Create paths for database and blocks file
     let db_path = PathBuf::from("./data/db");
+    let blocks_file = "./data/blocks.dat";
 
     // Create a wallet from mnemonic
     let signer = MnemonicBuilder::<English>::default()
@@ -205,7 +281,7 @@ fn main() -> Result<()> {
     alloc.insert(
         sender,
         GenesisAccount {
-            balance: U256::from(10_000_000_000_000_000_000u64), // 10 ETH
+            balance: U256::from_str("1000000000000000000000").unwrap(), // 1000 ETH to handle many transactions
             ..Default::default()
         },
     );
@@ -236,8 +312,8 @@ fn main() -> Result<()> {
     // Create block executor
     let executor = BlockExecutor::new(db_path, genesis)?;
     
-    // Generate blocks
-    let blocks = generate_test_blocks(&signer, recipient)?;
+    // Generate blocks with 42000 transactions each to get ~10MB blocks
+    generate_test_blocks(&signer, recipient, 42000, 2, blocks_file)?;
 
     // Print initial balances
     if let Some(balance) = executor.get_balance(&sender)? {
@@ -247,9 +323,13 @@ fn main() -> Result<()> {
         println!("Initial recipient balance: {}", balance);
     }
 
-    // Execute all blocks
-    for block in blocks.iter() {
-        executor.next_block(block)?;
+    // Read and execute blocks from file
+    let mut block_reader = BlockReader::new(blocks_file)?;
+    let mut block_count = 0;
+    
+    while let Some(block) = block_reader.next_block()? {
+        executor.next_block(&block)?;
+        block_count += 1;
 
         // Print balances after each block
         if let Some(balance) = executor.get_balance(&sender)? {
@@ -259,6 +339,8 @@ fn main() -> Result<()> {
             println!("Recipient balance: {}", balance);
         }
     }
+    
+    println!("Executed {} blocks from file", block_count);
 
     Ok(())
 }
@@ -279,7 +361,7 @@ fn create_test_block(transactions: Vec<TransactionSigned>) -> Block {
         logs_bloom: Bloom::default(),
         difficulty: U256::ZERO,
         number: block_number,
-        gas_limit: 30_000_000,
+        gas_limit: 1_000_000_000, // 1 billion gas limit to handle large blocks
         gas_used: 0,
         timestamp: 1234567890u64,
         extra_data: Bytes::default(),
