@@ -148,6 +148,50 @@ fn generate_test_blocks(
     Ok(())
 }
 
+/// Tracks and reports timing information for block execution steps
+struct BlockExecutionTimer {
+    start_time: Instant,
+    starts: BTreeMap<&'static str, Instant>,
+    timings: BTreeMap<&'static str, f64>,
+}
+
+impl BlockExecutionTimer {
+    fn new() -> Self {
+        Self {
+            start_time: Instant::now(),
+            starts: BTreeMap::new(),
+            timings: BTreeMap::new(),
+        }
+    }
+
+    fn start(&mut self, name: &'static str) {
+        self.starts.insert(name, Instant::now());
+    }
+
+    fn end(&mut self, name: &'static str) {
+        if let Some(start) = self.starts.remove(name) {
+            self.timings.insert(name, start.elapsed().as_secs_f64());
+        }
+    }
+
+    fn report(&self, block_number: u64, num_txs: usize, gas_used: u64, num_receipts: usize) {
+        let total_time = self.start_time.elapsed().as_secs_f64();
+        let tracked_time: f64 = self.timings.values().sum();
+        
+        println!("Block execution completed:");
+        println!("  Gas used: {}", gas_used);
+        println!("  Number of receipts: {}", num_receipts);
+        
+        println!("\nBlock {} timing breakdown:", block_number);
+        for (name, duration) in &self.timings {
+            println!("  {} time: {:.2}s", name, duration);
+        }
+        println!("  Total time: {:.2}s", total_time);
+        println!("  Other overhead: {:.2}s", total_time - tracked_time);
+        println!("  Transactions per second: {:.2}", num_txs as f64 / total_time);
+    }
+}
+
 /// Handles block execution and database interactions
 struct BlockExecutor {
     blockchain: BlockchainProvider<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
@@ -195,35 +239,37 @@ impl BlockExecutor {
             println!("Transaction signer: {}", tx.recover_signer().unwrap());
         }
 
-        let start_time = Instant::now();
+        let mut timer = BlockExecutionTimer::new();
         
-        // Measure provider setup time
-        let provider_setup_start = Instant::now();
+        // Provider setup
+        timer.start("Provider setup");
         let executor_provider = EthExecutorProvider::ethereum(self.spec.clone());
         let state_provider = self.blockchain.latest()?;
         let executor = executor_provider.executor(StateProviderDatabase::new(&state_provider));
-        let provider_setup_time = provider_setup_start.elapsed();
+        timer.end("Provider setup");
         
-        // Measure block recovery time
-        let recovery_start = Instant::now();
+        // Block recovery
+        timer.start("Block recovery");
         let recovered_block = RecoveredBlock::try_recover(block.clone())?;
-        let recovery_time = recovery_start.elapsed();
+        timer.end("Block recovery");
         
-        let execution_start = Instant::now();
+        // Block execution
+        timer.start("Execution");
         let result = executor.execute(&recovered_block)?;
-        let execution_time = execution_start.elapsed();
+        timer.end("Execution");
         
         // Store these before moving result
         let gas_used = result.gas_used;
         let num_receipts = result.receipts.len();
         
-        // Measure provider write setup time
-        let write_setup_start = Instant::now();
+        // Write setup
+        timer.start("Write setup");
         let provider_rw = self.blockchain.database_provider_rw()?;
         let execution_outcome = ExecutionOutcome::from((result, recovered_block.number()));
-        let write_setup_time = write_setup_start.elapsed();
-
-        let commit_start = Instant::now();
+        timer.end("Write setup");
+        
+        // State commit
+        timer.start("State commit");
         provider_rw.append_blocks_with_state(
             vec![recovered_block],
             &execution_outcome,
@@ -231,30 +277,9 @@ impl BlockExecutor {
             TrieUpdates::default(),
         )?;
         provider_rw.commit()?;
-        let commit_time = commit_start.elapsed();
+        timer.end("State commit");
         
-        let total_time = start_time.elapsed();
-        
-        println!("Block execution completed:");
-        println!("  Gas used: {}", gas_used);
-        println!("  Number of receipts: {}", num_receipts);
-        
-        println!("\nBlock {} timing breakdown:", block.number);
-        println!("  Provider setup time: {:.2}s", provider_setup_time.as_secs_f64());
-        println!("  Block recovery time: {:.2}s", recovery_time.as_secs_f64());
-        println!("  Execution time: {:.2}s", execution_time.as_secs_f64());
-        println!("  Write setup time: {:.2}s", write_setup_time.as_secs_f64());
-        println!("  State commit time: {:.2}s", commit_time.as_secs_f64());
-        println!("  Total time: {:.2}s", total_time.as_secs_f64());
-        println!("  Other overhead: {:.2}s", 
-            total_time.as_secs_f64() - 
-            (provider_setup_time.as_secs_f64() + 
-             recovery_time.as_secs_f64() + 
-             execution_time.as_secs_f64() + 
-             write_setup_time.as_secs_f64() + 
-             commit_time.as_secs_f64())
-        );
-        println!("  Transactions per second: {:.2}", block.body.transactions.len() as f64 / total_time.as_secs_f64());
+        timer.report(block.number, block.body.transactions.len(), gas_used, num_receipts);
         
         Ok(())
     }
