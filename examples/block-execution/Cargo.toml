@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 # reth dependencies
+reth.workspace = true
 reth-primitives = { path = "../../crates/primitives" }
 reth-primitives-traits = { path = "../../crates/primitives-traits" }
 reth-ethereum-primitives = { path = "../../crates/ethereum/primitives" }
@@ -20,6 +21,8 @@ reth-node-ethereum = { path = "../../crates/ethereum/node" }
 reth-trie = { path = "../../crates/trie/trie" }
 reth-e2e-test-utils = { path = "../../crates/e2e-test-utils" }
 reth-node-api = { path = "../../crates/node/api" }
+reth-node-core = { path = "../../crates/node/core" }
+futures = "0.3"
 
 # external dependencies
 alloy-primitives = { workspace = true }

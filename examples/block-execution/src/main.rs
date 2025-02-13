@@ -1,15 +1,34 @@
+use reth::{
+    api::NodeTypesWithDBAdapter,
+    beacon_consensus::EthBeaconConsensus,
+    providers::{
+        providers::{BlockchainProvider, StaticFileProvider},
+        ProviderFactory,
+    },
+    rpc::eth::EthApi,
+    utils::open_db_read_only,
+};
+
+use reth_node_ethereum::{
+    node::EthereumEngineValidator, EthEvmConfig, EthExecutorProvider, EthereumNode,
+};
+
+use reth::rpc::builder::{
+    RethRpcModule, RpcModuleBuilder, RpcServerConfig, TransportRpcModuleConfig,
+};
+
+use reth::tasks::TokioTaskExecutor;
+
 use alloy_primitives::{Address, B256, Bloom, Bytes, FixedBytes, U256, TxKind};
 use alloy_rpc_types_engine::ExecutionPayloadV1;
 use eyre::Result;
 use reth_primitives::{Block, BlockBody, Header, RecoveredBlock, Transaction, TransactionSigned};
 use alloy_consensus::{TxEip1559, BlockHeader, SignableTransaction};
 use reth_provider::{
-    providers::{StaticFileProvider, BlockchainProvider},
     BlockWriter, AccountReader, StateProviderFactory, DatabaseProviderFactory,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_chainspec::{ChainSpecBuilder, ChainSpec};
-use reth_node_ethereum::{EthereumNode, EthExecutorProvider};
 use reth_evm::execute::{BlockExecutorProvider, Executor, ExecutionOutcome};
 use reth_trie::{HashedPostStateSorted, updates::TrieUpdates};
 use std::{sync::Arc, str::FromStr, collections::BTreeMap};
@@ -22,14 +41,22 @@ use k256::ecdsa::SigningKey;
 use tokio::runtime::Runtime;
 use reth_db::{mdbx::DatabaseArguments, DatabaseEnv};
 use std::path::PathBuf;
-use reth_provider::ProviderFactory;
-use reth_node_api::NodeTypesWithDBAdapter;
 use std::io::{BufWriter, BufReader, Write, Read};
 use std::fs::File;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use reth_primitives_traits::transaction::signed::SignedTransaction;
 use std::time::Instant;
+// use reth_node_core::{
+//     consensus::beacon::BeaconConsensus as EthBeaconConsensus,
+//     eth::EthEvmConfig,
+//     rpc::{
+//         eth::EthApi,
+//         builder::{RethRpcModule, RpcModuleBuilder, RpcServerConfig, TransportRpcModuleConfig},
+//     },
+//     task::TokioTaskExecutor,
+// };
+use futures::future;
 
 /// Test mnemonic for wallet generation
 const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -288,6 +315,42 @@ impl BlockExecutor {
     fn get_balance(&self, address: &Address) -> Result<Option<U256>> {
         let state_provider = self.blockchain.latest()?;
         Ok(state_provider.basic_account(address)?.map(|account| account.balance))
+    }
+
+    /// Start the RPC server
+    pub async fn start_server(&self) -> Result<()> {
+        // Configure which RPC namespaces to expose
+        let module_config = TransportRpcModuleConfig::default().with_http([RethRpcModule::Eth]);
+
+        // Create the RPC module builder with our components
+        let rpc_builder = RpcModuleBuilder::default()
+            .with_provider(self.blockchain.clone())
+            .with_noop_pool()  // We don't need transaction pool for this example
+            .with_noop_network()  // We don't need network for this example
+            .with_executor(TokioTaskExecutor::default())
+            .with_evm_config(EthEvmConfig::new(self.spec.clone()))
+            .with_block_executor(EthExecutorProvider::ethereum(self.spec.clone()))
+            .with_consensus(EthBeaconConsensus::new(self.spec.clone()));
+
+        // Build the server modules
+        let server = rpc_builder.build(
+            module_config,
+            Box::new(EthApi::with_spawner),
+            Arc::new(EthereumEngineValidator::new(self.spec.clone())),
+        );
+
+        // Configure and start the server
+        let server_config = RpcServerConfig::http(Default::default())
+            .with_http_address("127.0.0.1:8545".parse().unwrap());
+
+        let handle = server_config.start(&server).await?;
+
+        println!("RPC server started at http://{}", handle.http_local_addr().unwrap());
+
+        // Keep the server running
+        future::pending::<()>().await;
+
+        Ok(())
     }
 }
 
