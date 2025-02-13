@@ -4,8 +4,8 @@ use eyre::Result;
 use reth_primitives::{Block, BlockBody, Header, RecoveredBlock, Transaction, TransactionSigned};
 use alloy_consensus::{TxEip1559, BlockHeader, SignableTransaction};
 use reth_provider::{
-    providers::StaticFileProvider,
-    BlockWriter, AccountReader,
+    providers::{StaticFileProvider, BlockchainProvider},
+    BlockWriter, AccountReader, StateProviderFactory, DatabaseProviderFactory,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_chainspec::{ChainSpecBuilder, ChainSpec};
@@ -28,11 +28,7 @@ use std::io::{BufWriter, BufReader, Write, Read};
 use std::fs::File;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
-use reth_primitives_traits::{
-    transaction::signed::SignedTransaction,
-    Block as BlockTrait,
-    BlockBody as BlockBodyTrait,
-};
+use reth_primitives_traits::transaction::signed::SignedTransaction;
 use std::time::Instant;
 
 /// Test mnemonic for wallet generation
@@ -154,7 +150,7 @@ fn generate_test_blocks(
 
 /// Handles block execution and database interactions
 struct BlockExecutor {
-    factory: ProviderFactory<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
+    blockchain: BlockchainProvider<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
     spec: Arc<ChainSpec>,
 }
 
@@ -186,7 +182,10 @@ impl BlockExecutor {
         // Initialize genesis state
         init_genesis(&factory)?;
 
-        Ok(Self { factory, spec })
+        // Create blockchain provider
+        let blockchain = BlockchainProvider::new(factory)?;
+
+        Ok(Self { blockchain, spec })
     }
 
     /// Execute and commit the next block
@@ -201,7 +200,7 @@ impl BlockExecutor {
         // Measure provider setup time
         let provider_setup_start = Instant::now();
         let executor_provider = EthExecutorProvider::ethereum(self.spec.clone());
-        let state_provider = self.factory.latest()?;
+        let state_provider = self.blockchain.latest()?;
         let executor = executor_provider.executor(StateProviderDatabase::new(&state_provider));
         let provider_setup_time = provider_setup_start.elapsed();
         
@@ -220,7 +219,7 @@ impl BlockExecutor {
         
         // Measure provider write setup time
         let write_setup_start = Instant::now();
-        let provider_rw = self.factory.provider_rw()?;
+        let provider_rw = self.blockchain.database_provider_rw()?;
         let execution_outcome = ExecutionOutcome::from((result, recovered_block.number()));
         let write_setup_time = write_setup_start.elapsed();
 
@@ -262,7 +261,7 @@ impl BlockExecutor {
 
     /// Get account balance
     fn get_balance(&self, address: &Address) -> Result<Option<U256>> {
-        let state_provider = self.factory.latest()?;
+        let state_provider = self.blockchain.latest()?;
         Ok(state_provider.basic_account(address)?.map(|account| account.balance))
     }
 }
