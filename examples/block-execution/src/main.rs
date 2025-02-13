@@ -220,8 +220,9 @@ impl BlockExecutionTimer {
 }
 
 /// Handles block execution and database interactions
+#[derive(Clone)]
 struct BlockExecutor {
-    blockchain: BlockchainProvider<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
+    blockchain: Arc<BlockchainProvider<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>>,
     spec: Arc<ChainSpec>,
 }
 
@@ -254,7 +255,7 @@ impl BlockExecutor {
         init_genesis(&factory)?;
 
         // Create blockchain provider
-        let blockchain = BlockchainProvider::new(factory)?;
+        let blockchain = Arc::new(BlockchainProvider::new(factory)?);
 
         Ok(Self { blockchain, spec })
     }
@@ -324,7 +325,7 @@ impl BlockExecutor {
 
         // Create the RPC module builder with our components
         let rpc_builder = RpcModuleBuilder::default()
-            .with_provider(self.blockchain.clone())
+            .with_provider((*self.blockchain).clone())
             .with_noop_pool()  // We don't need transaction pool for this example
             .with_noop_network()  // We don't need network for this example
             .with_executor(TokioTaskExecutor::default())
@@ -389,7 +390,8 @@ impl BlockReader {
 /// 2. Convert it to an execution payload
 /// 3. Execute it using Reth's EVM
 /// 4. Store the results in the database
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Delete existing database folder if it exists
     let _ = std::fs::remove_dir_all("./data");
     
@@ -414,7 +416,7 @@ fn main() -> Result<()> {
     alloc.insert(
         sender,
         GenesisAccount {
-            balance: U256::from_str("1000000000000000000000").unwrap(), // 1000 ETH to handle many transactions
+            balance: U256::from_str("1000000000000000000000").unwrap(), // 1000 ETH
             ..Default::default()
         },
     );
@@ -441,39 +443,51 @@ fn main() -> Result<()> {
         alloc,
         ..Default::default()
     };
-
+    
     // Create block executor
     let executor = BlockExecutor::new(db_path, genesis)?;
     
-    // Generate blocks with 42000 transactions each to get ~10MB blocks
-    generate_test_blocks(&signer, recipient, 42000, 2, blocks_file)?;
+    // Run blocking operations in a separate thread
+    let executor_clone = executor.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        // Generate blocks with 42000 transactions each to get ~10MB blocks
+        generate_test_blocks(&signer, recipient, 42000, 2, blocks_file)?;
 
-    // Print initial balances
-    if let Some(balance) = executor.get_balance(&sender)? {
-        println!("Initial sender balance: {}", balance);
-    }
-    if let Some(balance) = executor.get_balance(&recipient)? {
-        println!("Initial recipient balance: {}", balance);
-    }
-
-    // Read and execute blocks from file
-    let mut block_reader = BlockReader::new(blocks_file)?;
-    let mut block_count = 0;
-    
-    while let Some(block) = block_reader.next_block()? {
-        executor.next_block(&block)?;
-        block_count += 1;
-
-        // Print balances after each block
-        if let Some(balance) = executor.get_balance(&sender)? {
-            println!("Sender balance: {}", balance);
+        // Print initial balances
+        if let Some(balance) = executor_clone.get_balance(&sender)? {
+            println!("Initial sender balance: {}", balance);
         }
-        if let Some(balance) = executor.get_balance(&recipient)? {
-            println!("Recipient balance: {}", balance);
+        if let Some(balance) = executor_clone.get_balance(&recipient)? {
+            println!("Initial recipient balance: {}", balance);
         }
-    }
+
+        // Read and execute blocks from file
+        let mut block_reader = BlockReader::new(blocks_file)?;
+        let mut block_count = 0;
+        
+        while let Some(block) = block_reader.next_block()? {
+            executor_clone.next_block(&block)?;
+            block_count += 1;
+
+            // Print balances after each block
+            if let Some(balance) = executor_clone.get_balance(&sender)? {
+                println!("Sender balance: {}", balance);
+            }
+            if let Some(balance) = executor_clone.get_balance(&recipient)? {
+                println!("Recipient balance: {}", balance);
+            }
+        }
+        
+        println!("Executed {} blocks from file", block_count);
+        Ok::<(), eyre::Error>(())
+    });
+
+    // Wait for blocking operations to complete
+    handle.await??;
     
-    println!("Executed {} blocks from file", block_count);
+    // Start the RPC server and wait for it
+    println!("Starting RPC server...");
+    executor.start_server().await?;
 
     Ok(())
 }
@@ -546,4 +560,4 @@ mod tests {
         
         Ok(())
     }
-}
+} 
