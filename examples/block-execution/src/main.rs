@@ -14,7 +14,7 @@ use reth_node_ethereum::{
 };
 
 use reth::rpc::builder::{
-    RethRpcModule, RpcModuleBuilder, RpcServerConfig, TransportRpcModuleConfig,
+    RethRpcModule, RpcModuleBuilder, RpcServerConfig, TransportRpcModuleConfig, RpcServerHandle,
 };
 
 use reth::tasks::TokioTaskExecutor;
@@ -57,6 +57,8 @@ use std::time::Instant;
 //     task::TokioTaskExecutor,
 // };
 use futures::future;
+use reqwest::Client;
+use serde_json::{json, Value};
 
 /// Test mnemonic for wallet generation
 const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -319,7 +321,7 @@ impl BlockExecutor {
     }
 
     /// Start the RPC server
-    pub async fn start_server(&self) -> Result<()> {
+    pub async fn start_server(&self) -> Result<RpcServerHandle> {
         // Configure which RPC namespaces to expose
         let module_config = TransportRpcModuleConfig::default().with_http([RethRpcModule::Eth]);
 
@@ -348,10 +350,7 @@ impl BlockExecutor {
 
         println!("RPC server started at http://{}", handle.http_local_addr().unwrap());
 
-        // Keep the server running
-        future::pending::<()>().await;
-
-        Ok(())
+        Ok(handle)
     }
 }
 
@@ -383,6 +382,123 @@ impl BlockReader {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Tests various RPC methods and validates their responses
+async fn test_rpc_server(sender: Address, recipient: Address) -> Result<()> {
+    let client = Client::new();
+    let url = "http://127.0.0.1:8545";
+
+    println!("\nTesting RPC methods...");
+
+    // Helper function for making RPC calls
+    async fn rpc_call(client: &Client, url: &str, method: &str, params: Value) -> Result<Value> {
+        let response = client
+            .post(url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params
+            }))
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+
+        println!("\nMethod: {}", method);
+        println!("Response: {}", serde_json::to_string_pretty(&response)?);
+
+        if let Some(error) = response.get("error") {
+            return Err(eyre::eyre!("RPC error: {}", error));
+        }
+
+        Ok(response.get("result").unwrap_or(&Value::Null).clone())
+    }
+
+    println!("\n=== Testing Basic Node State ===");
+    
+    // Get latest block number
+    let block_number = rpc_call(&client, url, "eth_blockNumber", json!([])).await?;
+    let latest_block_hex = block_number.as_str().unwrap();
+    assert!(latest_block_hex.starts_with("0x"), "Block number should be hex");
+    let latest_block_num = u64::from_str_radix(&latest_block_hex[2..], 16).unwrap();
+    
+    println!("\n=== Testing Block Explorer Functionality ===");
+    println!("Simulating block explorer page load...");
+
+    // Get latest 5 blocks (simulating pagination)
+    for block_num in (0..=latest_block_num.min(4)).rev() {
+        println!("\nFetching block {}", block_num);
+        
+        // Get block with full transaction objects
+        let block = rpc_call(
+            &client,
+            url,
+            "eth_getBlockByNumber",
+            json!([format!("0x{:x}", block_num), true])
+        ).await?;
+        
+        // Extract and display block info
+        let block_obj = block.as_object().unwrap();
+        println!("Block number: {}", block_num);
+        println!("Timestamp: {}", block_obj.get("timestamp").unwrap());
+        println!("Transaction count: {}", 
+            block_obj.get("transactions")
+                .and_then(|t| t.as_array())
+                .map(|t| t.len())
+                .unwrap_or(0)
+        );
+
+        // For each transaction in the block, get its receipt
+        if let Some(txs) = block_obj.get("transactions").and_then(|t| t.as_array()) {
+            for (i, tx) in txs.iter().take(3).enumerate() { // Only show first 3 for brevity
+                let tx_hash = tx.get("hash").unwrap().as_str().unwrap();
+                println!("\nTransaction {}: {}", i + 1, tx_hash);
+                
+                // Get transaction receipt for status and gas used
+                let receipt = rpc_call(
+                    &client,
+                    url,
+                    "eth_getTransactionReceipt",
+                    json!([tx_hash])
+                ).await?;
+                
+                if let Some(receipt_obj) = receipt.as_object() {
+                    println!("Status: {}", receipt_obj.get("status").unwrap());
+                    println!("Gas Used: {}", receipt_obj.get("gasUsed").unwrap());
+                }
+            }
+        }
+    }
+
+    // Original balance and nonce checks
+    let sender_balance = rpc_call(
+        &client,
+        url,
+        "eth_getBalance",
+        json!([format!("{:#x}", sender), "latest"])
+    ).await?;
+    assert!(sender_balance.as_str().unwrap().starts_with("0x"), "Balance should be hex");
+
+    let recipient_balance = rpc_call(
+        &client,
+        url,
+        "eth_getBalance",
+        json!([format!("{:#x}", recipient), "latest"])
+    ).await?;
+    assert!(recipient_balance.as_str().unwrap().starts_with("0x"), "Balance should be hex");
+
+    let nonce = rpc_call(
+        &client,
+        url,
+        "eth_getTransactionCount",
+        json!([format!("{:#x}", sender), "latest"])
+    ).await?;
+    assert!(nonce.as_str().unwrap().starts_with("0x"), "Nonce should be hex");
+
+    println!("\nAll RPC tests completed successfully!");
+    Ok(())
 }
 
 /// A simple example showing how to:
@@ -485,11 +601,30 @@ async fn main() -> Result<()> {
     // Wait for blocking operations to complete
     handle.await??;
     
-    // Start the RPC server and wait for it
+    // Start the RPC server
     println!("Starting RPC server...");
-    executor.start_server().await?;
+    let executor_clone = executor.clone();
+    let server_handle = executor_clone.start_server().await?;
 
-    Ok(())
+    // Give the server time to start and verify it's running
+    println!("Waiting for RPC server to start...");
+    for _ in 0..5 {
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        if let Ok(response) = reqwest::get("http://127.0.0.1:8545").await {
+            if response.status() == 400 { // JSON-RPC endpoint returns 400 for GET requests
+                println!("RPC server is running!");
+                break;
+            }
+        }
+    }
+
+    // Run RPC tests
+    test_rpc_server(sender, recipient).await?;
+
+    // Clean exit
+    println!("Tests completed, shutting down...");
+    drop(server_handle); // Explicitly drop the server handle to shut it down
+    std::process::exit(0);
 }
 
 /// Creates a test block with the given transactions
