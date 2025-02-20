@@ -60,6 +60,54 @@ use futures::future;
 use reqwest::Client;
 use serde_json::{json, Value};
 
+/// Whether to read genesis configuration from disk
+const READ_GENESIS_FROM_DISK: bool = false;
+
+/// Path to the genesis file
+const GENESIS_FILE: &str = "./data/genesis.json";
+
+/// Read genesis configuration from a JSON file
+fn read_genesis_from_file(path: &str) -> Result<Genesis> {
+    let genesis_json = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&genesis_json)?)
+}
+
+/// Create a default genesis configuration
+fn create_default_genesis(sender: Address) -> Genesis {
+    // Create genesis configuration with pre-funded accounts
+    let mut alloc = BTreeMap::new();
+    alloc.insert(
+        sender,
+        GenesisAccount {
+            balance: U256::from_str("1000000000000000000000").unwrap(), // 1000 ETH
+            ..Default::default()
+        },
+    );
+    
+    // Create genesis configuration
+    Genesis {
+        config: ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0),
+            eip150_block: Some(0),
+            eip155_block: Some(0),
+            eip158_block: Some(0),
+            byzantium_block: Some(0),
+            constantinople_block: Some(0),
+            petersburg_block: Some(0),
+            istanbul_block: Some(0),
+            berlin_block: Some(0),
+            london_block: Some(0),
+            shanghai_time: Some(0),
+            terminal_total_difficulty: Some(U256::ZERO),
+            terminal_total_difficulty_passed: true,
+            ..Default::default()
+        },
+        alloc,
+        ..Default::default()
+    }
+}
+
 /// Test mnemonic for wallet generation
 const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
 
@@ -527,37 +575,11 @@ async fn main() -> Result<()> {
     
     println!("Using sender address: {}", sender);
     
-    // Create genesis configuration with pre-funded accounts
-    let mut alloc = BTreeMap::new();
-    alloc.insert(
-        sender,
-        GenesisAccount {
-            balance: U256::from_str("1000000000000000000000").unwrap(), // 1000 ETH
-            ..Default::default()
-        },
-    );
-    
-    // Create genesis configuration
-    let genesis = Genesis {
-        config: ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0),
-            eip150_block: Some(0),
-            eip155_block: Some(0),
-            eip158_block: Some(0),
-            byzantium_block: Some(0),
-            constantinople_block: Some(0),
-            petersburg_block: Some(0),
-            istanbul_block: Some(0),
-            berlin_block: Some(0),
-            london_block: Some(0),
-            shanghai_time: Some(0),
-            terminal_total_difficulty: Some(U256::ZERO),
-            terminal_total_difficulty_passed: true,
-            ..Default::default()
-        },
-        alloc,
-        ..Default::default()
+    // Get genesis configuration
+    let genesis = if READ_GENESIS_FROM_DISK {
+        read_genesis_from_file(GENESIS_FILE)?
+    } else {
+        create_default_genesis(sender)
     };
     
     // Create block executor
